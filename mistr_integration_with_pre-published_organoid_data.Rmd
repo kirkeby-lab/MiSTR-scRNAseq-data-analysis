@@ -1,0 +1,179 @@
+#Integration of D14 MiSTR with other datasets
+
+##Data filtration
+```{r}
+library(Seurat)
+sessionInfo()
+```
+
+###Functions
+```{r eval=FALSE}
+Filter_Mito_Ribo <- function(Seurat_obj){
+  mito.ribo.genes <- c(grep(pattern = '^MT-',
+                            rownames(Seurat_obj@assays$RNA@meta.features),
+                            value = T,
+                            ignore.case = T),
+                       grep(pattern = '^RPL',
+                            rownames(Seurat_obj@assays$RNA@meta.features),
+                            value = T,
+                            ignore.case = T),
+                       grep(pattern = '^RPS',
+                            rownames(Seurat_obj@assays$RNA@meta.features),
+                            value = T,
+                            ignore.case = T))
+  genes.to.use <- rownames(Seurat_obj@assays$RNA@meta.features)[!(rownames(Seurat_obj@assays$RNA@meta.features)
+                                                                  %in% mito.ribo.genes)]
+  Seurat_obj@assays$RNA@counts <- Seurat_obj@assays$RNA@counts[genes.to.use,]
+  Seurat_obj@assays$RNA@data <- Seurat_obj@assays$RNA@data[genes.to.use,]
+  Seurat_obj@assays$RNA@meta.features <- Seurat_obj@assays$RNA@meta.features[genes.to.use,]
+  return(Seurat_obj)
+}
+
+Integrate_data_CCA <- function(Seurat_list, name_list, nDims){
+  
+  reference.list <- Seurat_list[name_list]
+  anchors <- FindIntegrationAnchors(object.list = reference.list,
+                                    dims = 1:nDims,
+                                    scale = F)
+  integrated <- IntegrateData(anchorset = anchors,
+                              dims = 1:nDims)
+  return(integrated)
+}
+
+Set_Broad_Ident <- function(Seurat_Object){
+
+  labIdent <- Seurat_Object$orig.ident
+
+  names.kirk <- grep(labIdent, pattern = 'Day 14')
+  names.kant <- grep(labIdent, pattern = 'Day 10|Day 15|Day 32')
+  names.quad <- grep(labIdent, pattern = 'Org')
+
+  labIdent[names.kirk] <- 'Kirkeby'
+  labIdent[names.kant] <- 'Kanton'
+  labIdent[names.quad] <- 'Quadrato'
+
+  Seurat_Object <- AddMetaData(object = Seurat_Object, metadata = labIdent, col.name = 'lab.ident')
+
+  return(Seurat_Object)
+}
+
+doUmap <- function(SeuratObject, nDims, res = 0.5){
+  DefaultAssay(SeuratObject) <- 'integrated'
+  tmp.integrated <- ScaleData(SeuratObject, verbose = FALSE)
+  tmp.integrated <- FindVariableFeatures(tmp.integrated)
+  tmp.integrated <- RunPCA(tmp.integrated, npcs = nDims, verbose = FALSE)
+  tmp.integrated <- FindNeighbors(tmp.integrated, dims = 1:nDims)
+  tmp.integrated <- FindClusters(tmp.integrated, resolution = res)
+  tmp.integrated <- RunUMAP(tmp.integrated, dims = 1:nDims)
+  DefaultAssay(SeuratObject) <- 'RNA'
+
+  return(tmp.integrated)
+}
+```
+
+###load data
+```{r eval=FALSE}
+kirk_quad.raw <- readRDS('../rdsFiles/kirk_quad.raw.rds')
+kirk_kant.raw <- readRDS('../rdsFiles/kirk_kant.raw.rds')
+```
+
+###Split data
+```{r eval=FALSE}
+kirk_quad.list <- SplitObject(kirk_quad.raw, split.by = 'orig.ident')
+kirk_kant.list <- SplitObject(kirk_kant.raw, split.by = 'orig.ident')
+
+for (i in 1:length(kirk_quad.list)){
+  kirk_quad.list[[i]][['percent.mt']] <- PercentageFeatureSet(kirk_quad.list[[i]], pattern = "^MT-")
+  kirk_quad.list[[i]] <- Filter_Mito_Ribo(kirk_quad.list[[i]])
+}
+
+for (i in 1:length(kirk_kant.list)){
+  kirk_kant.list[[i]][['percent.mt']] <- PercentageFeatureSet(kirk_kant.list[[i]], pattern = "^MT-")
+  kirk_kant.list[[i]] <- Filter_Mito_Ribo(kirk_kant.list[[i]])
+}
+```
+
+###Filter
+```{r eval=FALSE}
+kirk_quad.list[[1]] <- subset(kirk_quad.list[[1]],
+                                 subset = nFeature_RNA > 200 & nFeature_RNA < 5700 & percent.mt < 5)
+kirk_quad.list[[2]] <- subset(kirk_quad.list[[2]],
+                                 subset = nFeature_RNA > 200 & nFeature_RNA < 5700 & percent.mt < 5)
+kirk_quad.list[[3]] <- subset(kirk_quad.list[[3]],
+                                 subset = nFeature_RNA > 200 & nFeature_RNA < 6000 & percent.mt < 5)
+kirk_quad.list[[4]] <- subset(kirk_quad.list[[4]],
+                                 subset = nFeature_RNA > 200 & nFeature_RNA < 4000 & percent.mt < 5)
+
+kirk_kant.list[[1]] <- subset(kirk_kant.list[[1]],
+                              subset = nFeature_RNA > 200 & nFeature_RNA < 5700 & percent.mt < 5)
+kirk_kant.list[[2]] <- subset(kirk_kant.list[[2]],
+                              subset = nFeature_RNA > 200 & nFeature_RNA < 5700 & percent.mt < 5)
+kirk_kant.list[[3]] <- subset(kirk_kant.list[[3]],
+                              subset = nFeature_RNA > 200 & nFeature_RNA < 6000 & percent.mt < 5)
+kirk_kant.list[[4]] <- subset(kirk_kant.list[[4]],
+                              subset = nFeature_RNA > 200 & nFeature_RNA < 6000 & percent.mt < 5)
+kirk_kant.list[[5]] <- subset(kirk_kant.list[[5]],
+                              subset = nFeature_RNA > 200 & nFeature_RNA < 6000 & percent.mt < 5)
+kirk_kant.list[[6]] <- subset(kirk_kant.list[[6]],
+                              subset = nFeature_RNA > 200 & nFeature_RNA < 6000 & percent.mt < 5)
+```
+
+###Normalization, cell cycle scoring, scaling & cell cycle regression
+```{r eval=FALSE}
+for (i in 1:length(kirk_quad.list)){
+  kirk_quad.list[[i]] <- NormalizeData(kirk_quad.list[[i]], verbose = F)
+  kirk_quad.list[[i]] <- CellCycleScoring(kirk_quad.list[[i]],
+                                             s.features = cc.genes$s.genes,
+                                             g2m.features = cc.genes$g2m.genes,
+                                             set.ident = F,
+                                             verbose = F)
+  kirk_quad.list[[i]] <- FindVariableFeatures(kirk_quad.list[[i]], verbose = F)
+  kirk_quad.list[[i]] <- ScaleData(kirk_quad.list[[i]],
+                                      vars.to.regress = c('S.Score', 'G2M.Score'),
+                                      features = rownames(kirk_quad.list[[i]]),
+                                      verbose = F)
+}
+
+for (i in 1:length(kirk_kant.list)){
+  kirk_kant.list[[i]] <- NormalizeData(kirk_kant.list[[i]], verbose = F)
+  kirk_kant.list[[i]] <- CellCycleScoring(kirk_kant.list[[i]],
+                                             s.features = cc.genes$s.genes,
+                                             g2m.features = cc.genes$g2m.genes,
+                                             set.ident = F,
+                                             verbose = F)
+  kirk_kant.list[[i]] <- FindVariableFeatures(kirk_kant.list[[i]], verbose = F)
+  kirk_kant.list[[i]] <- ScaleData(kirk_kant.list[[i]],
+                                      vars.to.regress = c('S.Score', 'G2M.Score'),
+                                      features = rownames(kirk_kant.list[[i]]),
+                                      verbose = F)
+}
+```
+
+##Integration
+```{r eval=FALSE}
+kirkeby_quad.integrated <- Integrate_data_CCA(kirk_quad.list,
+                                                 names(kirk_quad.list),
+                                                 20)
+
+kirkeby_kant.integrated <- Integrate_data_CCA(kirk_kant.list,
+                                              names(kirk_kant.list),
+                                              20)
+```
+
+##Post-integration analysis
+```{r eval=FALSE}
+kirkeby_quad.integrated <- doUmap(kirkeby_quad.integrated, 15)
+kirkeby_kant.integrated <- doUmap(kirkeby_kant.integrated, 18)
+
+kirkeby_quad.integrated <- Set_Broad_Ident(kirkeby_quad.integrated)
+kirkeby_kant.integrated <- Set_Broad_Ident(kirkeby_kant.integrated)
+```
+
+```{r}
+DimPlot(kirkeby_quad.integrated, group.by = 'lab.ident')
+FeaturePlot(kirkeby_quad.integrated, c('OTX2', 'STMN2', 'PAX8'))
+
+DimPlot(kirkeby_kant.integrated, group.by = 'lab.ident')
+FeaturePlot(kirkeby_kant.integrated, c('OTX2', 'STMN2', 'PAX8'))
+```
+

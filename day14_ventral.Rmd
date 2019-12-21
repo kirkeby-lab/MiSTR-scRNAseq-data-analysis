@@ -1,0 +1,156 @@
+---
+title: "D14 ventral"
+output: html_document
+---
+```{r}
+library(Seurat)
+library(tidyverse)
+library(parallel)
+library(dplyr)
+library(Matrix)
+library(ggplot2)
+library(cowplot)
+library(sctransform)
+library(future)
+```
+
+```{r}
+##########make needed functions###############
+cc.genes <- readLines(con = "/data/sc-seq/regev_lab_cell_cycle_genes.txt")
+#tf.genes <- readLines(con = "/data/sc-seq/tf_factors.txt")
+s.genes <- cc.genes[1:43]
+g2m.genes <- cc.genes[44:97]
+
+######Function for subsetting########
+
+
+object.subsetting <- function (seurat_obj){
+  seurat_obj.subset <-SubsetRow(seurat_obj, code= "^RP[SL][[:digit:]]"  , invert = TRUE)
+  seurat_obj.subset <-SubsetRow(data = seurat_obj.subset, code= "^RPLP"  , invert = TRUE)
+  seurat_obj.subset <- SubsetRow(data = seurat_obj.subset, code = "^MT-" , invert = TRUE)
+    seurat_obj.subset <- SubsetRow(data = seurat_obj.subset, code = "^MTRNR" , invert = TRUE)
+  
+  seurat_obj <- seurat_obj.subset
+}
+
+Filter_Mito_Ribo <- function(Seurat_obj){
+  "N.B. after running this fun $nCount_RNA and $nFeature_RNA will be wrong"
+  mito.ribo.genes <- c(grep(pattern = "^MT-", x = rownames(x = Seurat_obj@assays$RNA@meta.features), value = T, ignore.case = T), 
+                     grep(pattern = "^RPL", x = rownames(x = Seurat_obj@assays$RNA@meta.features), value = T, ignore.case = T),
+                     grep(pattern = "^RPS", x = rownames(x = Seurat_obj@assays$RNA@meta.features), value = T, ignore.case = T))
+  genes.to.use <- rownames(Seurat_obj@assays$RNA@meta.features)[!(rownames(Seurat_obj@assays$RNA@meta.features) %in% mito.ribo.genes)]
+  Seurat_obj@assays$RNA@counts <- Seurat_obj@assays$RNA@counts[genes.to.use,]
+  Seurat_obj@assays$RNA@data <- Seurat_obj@assays$RNA@data[genes.to.use,]
+  Seurat_obj@assays$RNA@meta.features <- Seurat_obj@assays$RNA@meta.features[genes.to.use,]
+  return(Seurat_obj)
+}
+
+
+
+Seurat.NormAndScale <- function(seurat_obj) {
+  
+  #seurat_obj <- SCTransform(seurat_obj, vars.to.regress = "nCount_RNA", verbose = FALSE)
+  
+  
+  seurat_obj<-NormalizeData(seurat_obj, normalization.method = "LogNormalize", scale.factor = 1e4)
+
+  seurat_obj<-FindVariableFeatures(seurat_obj, selection.method = "vst", nfeatures = 2000, do.plot=F)
+  
+      seurat_obj<-ScaleData(seurat_obj)
+}
+
+###########cell cycle############
+
+seurat.cellcycle <- function(seurat_obj){
+library(future)
+plan("multiprocess", workers = 20)
+options(future.globals.maxSize= 10000 * 1024^2)
+seurat_obj <- CellCycleScoring( seurat_obj, s.features  = s.genes, g2m.features = g2m.genes, set.ident = FALSE)
+
+seurat_obj <- ScaleData(seurat_obj, vars.to.regress = c("S.Score", "G2M.Score"), features = rownames(seurat_obj))
+seurat_obj<- FindVariableFeatures(object = seurat_obj, do.plot = FALSE)
+}
+```
+
+```{r}
+##########Read filtered 10X matrices and HTOs from citeseq-count##############
+d14v.data <- Read10X("/data/sc-10x/data-runs/170907-kirkeby-mistr/d14v-5000_cells/outs/filtered_feature_bc_matrix/")
+d14v.hto.outs <- Read10X("/projects/gaurav/citeseq_outs/d14v/umi_count/",gene.column=1)
+d14v.hto.outs <- d14v.hto.outs[-6,]
+```
+
+```{r}
+###########filtering matrices for same barcode###############
+
+joint.bcs <- intersect(colnames(d14v.data), colnames(d14v.hto.outs))
+
+d14v.data <- d14v.data[, joint.bcs]
+d14v.hto.outs <- as.matrix(d14v.hto.outs[, joint.bcs])
+```
+
+```{r}
+#########create seurat object of UMI data#####
+d14v <- CreateSeuratObject(d14v.data,project = "d14v")
+d14v <- Seurat.NormAndScale(d14v)
+```
+
+```{r}
+##########Adding HTO as an independent assay###########
+d14v[["HTO"]] <- CreateAssayObject(counts = d14v.hto.outs)
+
+d14v <- NormalizeData(d14v, assay = "HTO", normalization.method = "CLR")
+head(rownames(d14v[["HTO"]]))
+```
+
+```{r}
+##############Demultiplexing##########
+d14v <- HTODemux(d14v, assay = "HTO", positive.quantile = 0.99)
+table(d14v$HTO_classification.global)
+```
+
+```{r}
+Idents(d14v) <- "HTO_classification.global"
+d14v.singlet <- subset(d14v, idents = "Singlet")
+```
+
+```{r}
+d14v.singlet[["percent.mt"]] <- PercentageFeatureSet(d14v.singlet, pattern = "^MT-")
+d14v.singlet <- subset(d14v.singlet, subset = nFeature_RNA > 200 & nFeature_RNA < 7500 & percent.mt < 20)
+d14v.singlet <- Filter_Mito_Ribo(d14v.singlet)
+
+
+#######normalise#####
+d14v.singlet <- Seurat.NormAndScale(d14v.singlet)
+
+#########regress cell cycle
+d14v.singlet <- seurat.cellcycle(d14v.singlet)
+```
+
+```{r}
+DefaultAssay(d14v.singlet) <- "RNA"
+d14v.singlet <- ScaleData(d14v.singlet, verbose = T)
+d14v.singlet <- FindVariableFeatures(d14v.singlet)
+d14v.singlet <- RunPCA(d14v.singlet, npcs = 20, verbose = F)
+d14v.singlet <- FindNeighbors(d14v.singlet, dims = 1:20)
+d14v.singlet <- FindClusters(d14v.singlet, resolution = 0.5)
+
+```
+
+```{r}
+d14v.singlet <- RunUMAP(d14v.singlet, reduction = "pca", dims = 1:10)
+
+DimPlot(d14v.singlet, reduction = "umap",pt.size = .3)
+
+DimPlot(d14v.singlet, reduction = "umap",group.by = "HTO_classification", pt.size = .3)
+
+FeaturePlot(d14v.singlet, c("BST2","NKX2-1","OTX2","DCX","GBX2"), min.cutoff = "q10",pt.size = .3)
+```
+
+```{r}
+d14v.markers <- FindAllMarkers(d14v.singlet, only.pos = TRUE, min.pct = 0.25, logfc.threshold = 0.25)
+####Save seurat object########
+saveRDS(d14v.singlet, file = "/projects/gaurav/ms_submission/d14v_rds/day14_ventral.rds")
+write.table(d14v.markers,file = "/projects/gaurav/ms_submission/d14v_rds/day14_ventral.markers")
+write.csv(d14v.markers,file = "/projects/gaurav/ms_submission/d14d_rds/day14_ventral.markers.csv")
+```
+

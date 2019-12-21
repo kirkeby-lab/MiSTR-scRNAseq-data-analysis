@@ -1,0 +1,296 @@
+---
+output:
+  pdf_document: default
+  html_document: default
+---
+######analysis####
+
+```{r}
+library(Seurat)
+library(tidyverse)
+library(parallel)
+library(dplyr)
+library(Matrix)
+
+```
+
+```{r}
+
+##############constants############
+analysis_prefix <- "all-data-points"
+
+cc.genes <- readLines(con = "/data/sc-seq/regev_lab_cell_cycle_genes.txt")
+#tf.genes <- readLines(con = "/data/sc-seq/tf_factors.txt")
+s.genes <- cc.genes[1:43]
+g2m.genes <- cc.genes[44:97]
+
+######required functions######
+
+
+######Function for subsetting########
+
+object.subsetting <- function (seurat_obj){
+  seurat_obj.subset <-SubsetRow(seurat_obj, code= "^RP[SL][[:digit:]]"  , invert = TRUE)
+  seurat_obj.subset <-SubsetRow(data = seurat_obj.subset, code= "^RPLP"  , invert = TRUE)
+  seurat_obj.subset <- SubsetRow(data = seurat_obj.subset, code = "^MT-" , invert = TRUE)
+    seurat_obj.subset <- SubsetRow(data = seurat_obj.subset, code = "^MTRNR" , invert = TRUE)
+  
+  seurat_obj <- seurat_obj.subset
+}
+
+
+Seurat.AddMitoRiboPct <- function(seurat_obj) {
+  ribo.genes <- grep(pattern = "^RP[SL][[:digit:]]", x = rownames(x = seurat_obj@data), value = TRUE)
+  mito.genes <- grep(pattern = "^MT-", x = rownames(x = seurat_obj@data), value = TRUE, ignore.case=TRUE)
+  percent.ribo <- Matrix::colSums(seurat_obj@raw.data[ribo.genes, ])/Matrix::colSums(seurat_obj@raw.data)
+  percent.mito <- Matrix::colSums(seurat_obj@raw.data[mito.genes, ])/Matrix::colSums(seurat_obj@raw.data)
+  seurat_obj <- AddMetaData(object = seurat_obj, metadata = percent.ribo, col.name = "percent.ribo")
+  seurat_obj <- AddMetaData(object = seurat_obj, metadata = percent.mito, col.name = "percent.mito")
+}
+
+###########cell cycle############
+
+seurat.cellcycle <- function(seurat_obj){
+seurat_obj <- CellCycleScoring(object = seurat_obj, s.genes = s.genes, g2m.genes = g2m.genes, 
+                       set.ident = FALSE)
+
+seurat_obj <- ScaleData(object = seurat_obj, vars.to.regress = c("S.Score", "G2M.Score"), 
+                display.progress = TRUE)
+seurat_obj<- FindVariableGenes(object = seurat_obj, do.plot = FALSE)
+}
+
+Seurat.Filter1 <- function(seurat_obj) {
+  seurat_obj <- FilterCells(object = seurat_obj, subset.names = c("nGene", "percent.mito", "percent.ribo"),
+                            low.thresholds = c(200, -Inf, -Inf), high.thresholds = c(4000,.05,.6))
+}
+
+
+Seurat.Filter2 <- function(seurat_obj) {
+  seurat_obj <- FilterCells(object = seurat_obj, subset.names = c("nGene", "percent.mito","percent.ribo"),
+                            low.thresholds = c(200, -Inf, -Inf), high.thresholds = c(6000,.05, .6))
+}
+
+Seurat.NormAndScale <- function(seurat_obj) {
+  seurat_obj<-NormalizeData(seurat_obj, normalization.method = "LogNormalize", scale.factor = 1e4)
+    seurat_obj<-ScaleData(seurat_obj, vars.to.regress = c("nUMI"))
+  #seurat_obj<-ScaleData(seurat_obj, vars.to.regress = c("nUMI", "percent.mito", "percent.ribo"))
+  #seurat_obj<-ScaleData(seurat_obj, vars.to.regress = c("nUMI","percent.mito"), use.umi=T, model.use="negbinom") # too slow
+  seurat_obj<-FindVariableGenes(seurat_obj, do.plot=F)
+}
+```
+
+```{r}
+#################Read data###############
+##########################################
+##########################################
+
+
+d0es.data <- Read10X(data.dir = "/raid5/data/sc-10x/data-runs/170907-kirkeby-mistr/d0es-5000_cells/outs/filtered_gene_bc_matrices/hg19/")
+d1d.data <- Read10X(data.dir = "/raid5/data/sc-10x/data-runs/170907-kirkeby-mistr/d1d-5000_cells/outs/filtered_gene_bc_matrices/hg19/")
+d1v.data <- Read10X(data.dir = "/raid5/data/sc-10x/data-runs/170907-kirkeby-mistr/d1v-5000_cells/outs/filtered_gene_bc_matrices/hg19/")
+d2d.data <- Read10X(data.dir = "/projects/gaurav//170907-kirkeby-mistr/48hrsd-5000_cells/outs/filtered_gene_bc_matrices/hg19/")
+d2v.data <- Read10X(data.dir = "/projects/gaurav/data-runs/170907-kirkeby-mistr/d2v-5000_cells/outs/filtered_gene_bc_matrices/hg19/")
+
+
+```
+
+```{r}
+##################subsetting##############
+
+d0es.subset <- object.subsetting(d0es.data)
+d1d.subset <- object.subsetting(d1d.data)
+d1v.subset <- object.subsetting(d1v.data)
+d2d.subset <- object.subsetting(d2d.data)
+d2v.subset <- object.subsetting(d2v.data)
+
+
+####################create seurat object##################
+d0es <- CreateSeuratObject(raw.data = d0es.subset, min.cells = 8, min.genes = 200, project = "d0es")
+d1d <- CreateSeuratObject(raw.data = d1d.subset, min.cells = 1, min.genes = 200, project = "d1d")
+d1v <- CreateSeuratObject(raw.data = d1v.subset, min.cells = 8, min.genes = 200, project = "d1v")
+d2d <- CreateSeuratObject(raw.data = d2d.subset, min.cells =4 , min.genes = 200, project = "d2d" )
+d2v <- CreateSeuratObject(raw.data = d2v.subset, min.cells =4 , min.genes = 200, project = "d2v" )
+
+```
+
+```{r}
+d0es <- FilterCells(object = d0es, subset.names = c("nGene"), low.thresholds = c(200), high.thresholds = c(5000))
+d1d <- FilterCells(object = d1d, subset.names = c("nGene"), low.thresholds = c(200), high.thresholds = c(8000))
+d1v <- FilterCells(object = d1v, subset.names = c("nGene"), low.thresholds = c(200), high.thresholds = c(6000))
+d2d <- FilterCells(object = d2d, subset.names = c("nGene"), low.thresholds = c(200), high.thresholds = c(4500))
+d2v <- FilterCells(object = d2v, subset.names = c("nGene"), low.thresholds = c(200), high.thresholds = c(6500))
+
+```
+
+
+
+```{r}
+##########normalisation and scaling#######
+d0es <- Seurat.NormAndScale(d0es)
+d1d <- Seurat.NormAndScale(d1d)
+d1v <- Seurat.NormAndScale(d1v)
+d2d <- Seurat.NormAndScale(d2d)
+d2v <- Seurat.NormAndScale(d2v)
+
+```
+
+```{r}
+##########cellcycleregression#######
+d0es <- seurat.cellcycle(d0es)
+d1d <- seurat.cellcycle(d1d)
+d1v <- seurat.cellcycle(d1v)
+d2d <- seurat.cellcycle(d2d)
+d2v <- seurat.cellcycle(d2v)
+
+```
+
+
+```{r}
+#######time to run CCA##########
+#######day 1 dorsal and ventral#########
+d0es@meta.data$sample <- "d0es"
+
+#########day1##########
+d1d@meta.data$day1 <- "day1"
+d1d@meta.data$sample <- "d1d"
+
+d1v@meta.data$day1 <- "day1"
+d1v@meta.data$sample <- "d1v"
+
+##############day2#########
+
+d2d@meta.data$day2 <- "day2"
+d2d@meta.data$sample <- "d2d"
+
+d2v@meta.data$day2 <- "day2"
+d2v@meta.data$sample <- "d2v"
+```
+
+```{r}
+#########cca of day 1 - day 2 and until day 2##########
+#################CCA of day 1##############
+d1d.g.1 <- head(rownames(d1d@hvg.info), 1000)
+d1v.g.2 <- head(rownames(d1v@hvg.info), 1000)
+genes.use <- unique(c(d1d.g.1, d1v.g.2))
+genes.use <- intersect(genes.use, rownames(d1d@scale.data))
+genes.use <- intersect(genes.use, rownames(d1v@scale.data))
+
+
+day1.dv <- RunCCA(object = d1v, object2 = d1d, genes.use = genes.use, add.cell.id1 = "d1v", add.cell.id2 = "d1d")
+
+day1.dv <- AlignSubspace(day1.dv, reduction.type = "cca", grouping.var = "sample", dims.align = 1:20)
+
+##############CCA of Day2 ###############
+d2d.g.1 <- head(rownames(d2d@hvg.info), 1000)
+d2v.g.2 <- head(rownames(d2v@hvg.info), 1000)
+genes.use.d2 <- unique(c(d2d.g.1, d2v.g.2))
+genes.use.d2 <- intersect(genes.use, rownames(d2d@scale.data))
+genes.use.d2 <- intersect(genes.use, rownames(d2v@scale.data))
+
+day2.dv <- RunCCA(object = d2d, object2 = d2v, genes.use = genes.use, add.cell.id1 = "d2d", add.cell.id2 = "d2v")
+
+
+day2.dv <- AlignSubspace(day2.dv, reduction.type = "cca", grouping.var = "sample", dims.align = 1:20)
+
+```
+
+```{r}
+########################CCA of alll aligned datasets
+
+###########look for hvg############
+d0es <- FindVariableGenes(object = d0es, mean.function = ExpMean, dispersion.function = LogVMR, x.low.cutoff = 0.0125, x.high.cutoff = 3,y.cutoff = 0.5)
+
+day1.dv <- FindVariableGenes(object = day1.dv, mean.function = ExpMean, dispersion.function = LogVMR, x.low.cutoff = 0.0125, x.high.cutoff = 3,y.cutoff = 0.5)
+
+
+day2.dv <- FindVariableGenes(object = day2.dv, mean.function = ExpMean, dispersion.function = LogVMR, x.low.cutoff = 0.0125, x.high.cutoff = 3,y.cutoff = 0.5)
+
+
+
+
+
+day1.dv <- ScaleData(object = day1.dv)
+day2.dv <- ScaleData(object = day2.dv)
+
+
+#############rename previously cca objects################
+d0es <- RenameCells(d0es, add.cell.id = "day0" , for.merge = TRUE)
+day1.dv <- RenameCells(day1.dv, add.cell.id = "day1" , for.merge = TRUE)
+
+day2.dv <- RenameCells(day2.dv, add.cell.id = "day2" , for.merge = TRUE)
+
+
+d0es@meta.data$day <- "day0"
+day1.dv@meta.data$day <- "day1"
+day2.dv@meta.data$day <- "day2"
+
+
+#######################Multi CCA all time points##############
+###########select highly variable genes##############
+
+ob.list <- list(d0es,day1.dv, day2.dv)
+genes.use <- c()
+for (i in 1:length(ob.list)) {
+  genes.use <- c(genes.use, head(rownames(ob.list[[i]]@hvg.info), 1000))
+}
+genes.use <- names(which(table(genes.use) > 1))
+for (i in 1:length(ob.list)) {
+  genes.use <- genes.use[genes.use %in% rownames(ob.list[[i]]@scale.data)]
+}
+
+
+# Run multi-set CCA
+all.merge.c <- RunMultiCCA(ob.list, genes.use = genes.use,  num.ccs = 20)
+
+
+# Run rare non-overlapping filtering
+all.merge.c <- CalcVarExpRatio(object = all.merge.c, reduction.type = "pca",grouping.var = "sample", dims.use = 1:20)
+all.merge.c <- SubsetData(all.merge.c, subset.name = "var.ratio.pca",accept.low = 0.5)
+
+# Alignment
+all.merge.c <- AlignSubspace(all.merge.c, reduction.type = "cca",grouping.var = "sample",dims.align = 1:20)
+
+```
+
+
+```{r}
+############figures ########
+
+########for day1 dorso ventral ##########
+
+day1.dv <- FindVariableGenes(object = day1.dv, mean.function = ExpMean, dispersion.function = LogVMR, x.low.cutoff = 0.0125, x.high.cutoff = 3, y.cutoff = 0.5)
+
+day1.dv <- RunPCA(day1.dv)
+
+
+
+
+
+#############for all.merge###########
+
+
+all.merge.c <- FindVariableGenes(object = all.merge.c, mean.function = ExpMean, dispersion.function = LogVMR, x.low.cutoff = 0.0125, x.high.cutoff = 3, y.cutoff = 0.5)
+
+all.merge.c <- RunPCA(all.merge.c)
+
+
+
+
+```
+
+```{r}
+###########figures#######
+####### genes for day 1 merged cells#########
+DimPlot(day1.dv, reduction.use = "pca", pt.size = 0.3)
+
+FeaturePlot(object = day1.dv, features.plot = c("OTX2","GBX2","SP5","RBP1","FST"), cols.use = c("grey", "blue"),reduction.use = "pca")
+PCHeatmap(object = day1.dv, pc.use = 2, cells.use = 500, do.balanced = TRUE, label.columns = FALSE)
+
+
+########all time points merged datasets######
+DimPlot(all.merge.c, reduction.use = "pca", pt.size = 0.3, group.by = "sample")
+FeaturePlot(object = all.merge.c, features.plot = c("NANOG","DDIT4","CRABP2","MAP1B","SOX1"), cols.use = c("grey", "blue"),reduction.use = "pca")
+PCHeatmap(object = all.merge.c, pc.use = 1, cells.use = 500, do.balanced = TRUE, label.columns = FALSE)
+
+```
+

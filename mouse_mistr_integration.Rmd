@@ -1,0 +1,393 @@
+```{r}
+
+#################load libraries to be used #############
+library(Seurat)
+library(tidyverse)
+library(parallel)
+library(dplyr)
+library(Matrix)
+library(ggplot2)
+library(cowplot)
+library(sctransform)
+library(SeuratWrappers)
+```
+
+```{r}
+
+
+cc.genes <- readLines(con = "/data/sc-seq/regev_lab_cell_cycle_genes.txt")
+
+s.genes <- cc.genes[1:43]
+g2m.genes <- cc.genes[44:97]
+
+'%not%' <- Negate('%in%')
+
+######Function for subsetting########
+
+
+object.subsetting <- function (seurat_obj){
+  seurat_obj.subset <-SubsetRow(seurat_obj, code= "^RP[SL][[:digit:]]"  , invert = TRUE)
+  seurat_obj.subset <-SubsetRow(data = seurat_obj.subset, code= "^RPLP"  , invert = TRUE)
+  seurat_obj.subset <- SubsetRow(data = seurat_obj.subset, code = "^MT-" , invert = TRUE)
+    seurat_obj.subset <- SubsetRow(data = seurat_obj.subset, code = "^MTRNR" , invert = TRUE)
+  
+  seurat_obj <- seurat_obj.subset
+}
+
+#############for ortholog mapping############
+Seurat_m_to_h_gene_map <- function(Seurat_raw)
+{
+  
+  library(biomaRt)
+ mart1 = useMart("ensembl", dataset="hsapiens_gene_ensembl")
+ mart2 = useMart("ensembl", dataset="mmusculus_gene_ensembl") 
+  
+t <- getBM(filters= "external_gene_name", attributes= c("ensembl_gene_id",
+ "external_gene_name"),values= Seurat_raw@Dimnames[[1]],mart= mart2)
+
+#############################converting mouse ensemble id to human ensemble id#######
+#library(EnsDb.Hsapiens.v75)
+
+u <-  getLDS(attributes=c("ensembl_gene_id"),
+           filters="ensembl_gene_id", values=t$ensembl_gene_id, mart=mart2,
+           attributesL=c("ensembl_gene_id","external_gene_name"), martL=mart1)
+
+ 
+ ################now delete the gene names from matrix which did not map3########
+ 
+ #m <- which(rownames(Seurat_raw) %not% t$external_gene_name)
+ Seurat_raw <- Seurat_raw[t$external_gene_name,]
+ 
+#######replace genbe name with ensemble id
+Seurat_raw@Dimnames[[1]] <- t$ensembl_gene_id
+ 
+ ###################delete the gene names which did not map to human###########
+# n <- which(rownames(Seurat_raw) %not% u$Gene.stable.ID)
+ 
+ Seurat_raw <- Seurat_raw[u$Gene.stable.ID,]
+ 
+
+ 
+ 
+ 
+ #####replace the gene names with mapped human gen names#######
+  Seurat_raw@Dimnames[[1]] <- u$Gene.name
+ 
+ Seurat_raw@Dimnames[[1]]  <- make.unique(Seurat_raw@Dimnames[[1]] )
+ 
+ return(Seurat_raw)
+}
+
+##############ribo mito deletion###########
+
+Filter_Mito_Ribo <- function(Seurat_obj){
+  "N.B. after running this fun $nCount_RNA and $nFeature_RNA will be wrong"
+  mito.ribo.genes <- c(grep(pattern = "^MT-", x = rownames(x = Seurat_obj@assays$RNA@meta.features), value = T, ignore.case = T), 
+                     grep(pattern = "^RPL", x = rownames(x = Seurat_obj@assays$RNA@meta.features), value = T, ignore.case = T),
+                     grep(pattern = "^RPS", x = rownames(x = Seurat_obj@assays$RNA@meta.features), value = T, ignore.case = T))
+  genes.to.use <- rownames(Seurat_obj@assays$RNA@meta.features)[!(rownames(Seurat_obj@assays$RNA@meta.features) %in% mito.ribo.genes)]
+  Seurat_obj@assays$RNA@counts <- Seurat_obj@assays$RNA@counts[genes.to.use,]
+  Seurat_obj@assays$RNA@data <- Seurat_obj@assays$RNA@data[genes.to.use,]
+  Seurat_obj@assays$RNA@meta.features <- Seurat_obj@assays$RNA@meta.features[genes.to.use,]
+  return(Seurat_obj)
+}
+
+
+Seurat.NormAndScale <- function(seurat_obj) {
+  
+  #seurat_obj <- SCTransform(seurat_obj, vars.to.regress = "nCount_RNA", verbose = FALSE)
+  
+  
+  seurat_obj<-NormalizeData(seurat_obj, normalization.method = "LogNormalize", scale.factor = 1e4)
+
+  seurat_obj<-FindVariableFeatures(seurat_obj, selection.method = "vst", nfeatures = 2000, do.plot=F)
+  
+      seurat_obj<-ScaleData(seurat_obj)
+}
+
+###########cell cycle############
+
+
+
+seurat.cellcycle <- function(seurat_obj){
+library(future)
+plan("multiprocess", workers = 20)
+options(future.globals.maxSize= 10000 * 1024^2)
+seurat_obj <- CellCycleScoring( seurat_obj, s.features  = s.genes, g2m.features = g2m.genes, set.ident = FALSE)
+
+seurat_obj <- ScaleData(seurat_obj, vars.to.regress = c("S.Score", "G2M.Score"), features = rownames(seurat_obj))
+seurat_obj<- FindVariableFeatures(object = seurat_obj, do.plot = FALSE)
+}
+```
+
+```{r}
+#########################################################
+############laod marioni  data##################
+jm.data <- Read10X(data.dir = "/projects/gaurav/marioni-data/atlas/")
+jm.data.c <- jm.data
+jm.data.c <- Seurat_m_to_h_gene_map(jm.data.c)
+
+
+##########################################################
+#############load kirkeby data###########################
+d14d1.data <- Read10X(data.dir = "/raid5/home/cbmr/kgr851/data-runs/170907-kirkeby-mistr/d14dc-5000_cells/outs/filtered_gene_bc_matrices/hg19/")
+d14d2.data <- Read10X(data.dir = "/raid5/home/cbmr/kgr851/data-runs/170907-kirkeby-mistr/d14-d-d-5000_cells/outs/filtered_gene_bc_matrices/hg19/")
+d14d3.data <- Read10X(data.dir = "/raid5/home/cbmr/kgr851/data-runs/170907-kirkeby-mistr/d14-d-e-5000_cells/outs/filtered_gene_bc_matrices/hg19/")
+```
+
+```{r}
+###########time to use marioni lab's annotations###########
+##############read metadata##################
+mouse_meta.data <- read.table("/projects/gaurav/marioni-data/atlas/meta.tab",header = T, sep = "\t", fill = F)
+
+rownames(mouse_meta.data) <- mouse_meta.data$cell
+```
+
+```{r}
+##########################################
+#############create Seurat object############
+d14d1 <- CreateSeuratObject(counts  = d14d1.data, min.cells =4 , min.features = 200, project = "set1" )
+d14d2 <- CreateSeuratObject(counts  = d14d2.data, min.cells =4 , min.features = 200, project = "set2" )
+d14d3 <- CreateSeuratObject(counts  = d14d3.data, min.cells =4 , min.features = 200, project = "set3" )
+```
+
+```{r}
+d14d1[["percent.mt"]] <- PercentageFeatureSet(d14d1, pattern = "^MT-")
+d14d2[["percent.mt"]] <- PercentageFeatureSet(d14d2, pattern = "^MT-")
+d14d3[["percent.mt"]] <- PercentageFeatureSet(d14d3, pattern = "^MT-")
+```
+
+```{r}
+#########create seurat object for marioni lab with their annotations ############
+jm <- CreateSeuratObject(jm.data.c,meta.data = mouse_meta.data, project = "jm")
+
+```
+
+```{r}
+d14d1 <- subset(d14d1, subset = nFeature_RNA > 200 & nFeature_RNA < 5700 & percent.mt < 5)
+d14d2 <- subset(d14d2, subset = nFeature_RNA > 200 & nFeature_RNA < 5700 & percent.mt < 5)
+d14d3 <- subset(d14d3, subset = nFeature_RNA > 200 & nFeature_RNA < 6000 & percent.mt < 5)
+```
+
+```{r}
+d14d1 <- Filter_Mito_Ribo(d14d1)
+d14d2 <- Filter_Mito_Ribo(d14d2)
+d14d3 <- Filter_Mito_Ribo(d14d3)
+```
+
+
+```{r}
+d14d1 <- Seurat.NormAndScale(d14d1)
+d14d2 <- Seurat.NormAndScale(d14d2)
+d14d3 <- Seurat.NormAndScale(d14d3)
+jm <- Seurat.NormAndScale(jm)
+```
+
+```{r}
+d14d1 <- seurat.cellcycle(d14d1)
+d14d2 <- seurat.cellcycle(d14d2)
+d14d3 <- seurat.cellcycle(d14d3)
+```
+
+```{r}
+##############separate datasets from Jm #######
+
+
+jm.pca <- readRDS("/projects//gaurav/marioni-data/atlas/corrected_pcas.rds")
+
+
+#################for e8.5 cells###############
+
+stage8.5_pca <- jm.pca$stage$E8.5
+v <- rownames(stage8.5_pca)
+
+e8.5 <- subset(jm, cells = v )
+
+```
+
+```{r}
+##################pre processing of subsetted datasets from jm lab#######
+
+#############normalisation and scaling#########
+
+
+e8.5 <- Seurat.NormAndScale(e8.5)
+
+
+
+############cell cycle noise regression######
+#########after this cells are ready to be exported to other packages#######
+
+e8.5 <- seurat.cellcycle(e8.5)
+
+```
+
+```{r}
+#######time to run CCA##########
+#######add meta data for sample/runs #########
+
+#############day14##########
+
+d14d1@meta.data$sample <- "d14d1"
+d14d1@meta.data$lab <- "kirkeby"
+
+d14d2@meta.data$sample <- "d14d2"
+d14d2@meta.data$lab <- "kirkeby"
+
+d14d3@meta.data$sample <- "d14d3"
+d14d3@meta.data$lab <- "kirkeby"
+
+#############mouse e8.5##########
+
+e8.5@meta.data$sample <- "e8.5"
+e8.5@meta.data$lab <- "marioni"
+```
+
+```{r}
+################integrate day 14 dorsal data##################
+day14.list <- list( d14d1, d14d2, d14d3)
+
+#day14.anchors <- FindIntegrationAnchors(object.list = day14.list, dims = 1:20,scale = T, max.features = 1000, verbose =T, l2.norm = T )
+day14.anchors <- FindIntegrationAnchors(object.list = day14.list, dims = 1:20)
+
+day14.integrated <- IntegrateData(anchorset = day14.anchors, dims = 1:20)
+
+DefaultAssay(day14.integrated) <- "RNA"
+
+day14.integrated <- ScaleData(day14.integrated, verbose = T)
+day14.integrated <- FindVariableFeatures(day14.integrated)
+day14.integrated <- RunPCA(day14.integrated, npcs = 30, verbose = F)
+
+day14.integrated <- RunUMAP(day14.integrated, reduction = "pca", dims = 1:15)
+
+#DefaultAssay(day14.integrated) <- "RNA"
+
+FeaturePlot(day14.integrated, c("SOX10","OTX2","GBX2","FGF17"), min.cutoff = "q10")
+```
+
+
+
+```{r}
+######## making marioni and kirkeby matrices ready for integration########
+
+day14.integrated@meta.data$lab <- "kirkeby"
+
+
+
+e8.5@meta.data$lab <- "marioni"
+```
+
+```{r}
+###########integration of marioni and kirkeby dataset##########
+
+############recalculating HVG and rescaling dataset#######
+
+jm.e8.5_kirkeby.integration_list <- list( e8.5, day14.integrated)
+
+ jm.e8.5_kirkeby.integration_list <- lapply(X = jm.e8.5_kirkeby.integration_list, FUN = function(x) {
+    x <- NormalizeData(x)
+    x <- FindVariableFeatures(x)
+})
+ 
+##########integration##########
+ 
+all.merge.anchors <- FindIntegrationAnchors(object.list = jm.e8.5_kirkeby.integration_list, dims = 1:20)
+ 
+all.integrated<- IntegrateData(anchorset = all.merge.anchors, dims = 1:20)
+DefaultAssay(all.integrated) <- "integrated"
+
+# Run the standard workflow for visualization and clustering
+all.integrated <- ScaleData(all.integrated, verbose = FALSE)
+all.integrated <- FindVariableFeatures(all.integrated)
+
+all.integrated <- RunPCA(all.integrated, npcs = 25, verbose = FALSE)
+
+all.integrated <- RunUMAP(all.integrated, reduction = "pca", dims = 1:20)
+DimPlot(all.integrated, reduction = "umap", group.by = "lab")
+DimPlot(all.integrated, reduction = "umap", group.by = "sample")
+
+FeaturePlot(all.integrated, c("SOX10","OTX2","GBX2","FGF17"), min.cutoff = "q10")
+```
+
+```{r}
+saveRDS(all.integrated, file = "/projects/gaurav/ms_submission/e8.5_rds/jmak.rds")
+```
+
+
+
+```{r}
+################take neural cells vector out from meta.data#########
+Rostral_neurectoderm <- as.vector(rownames(e8.5@meta.data[e8.5@meta.data$celltype == "Rostral neurectoderm",]))
+Neural_crest         <- as.vector(rownames(e8.5@meta.data[e8.5@meta.data$celltype == "Neural crest", ]))
+FBMBHB               <- as.vector(rownames(e8.5@meta.data[e8.5@meta.data$celltype == "Forebrain/Midbrain/Hindbrain",]))
+spinal_cord          <- as.vector(rownames(e8.5@meta.data[e8.5@meta.data$celltype == "Spinal cord", ]))
+neuro                <- paste0(c(spinal_cord,FBMBHB,Neural_crest,Rostral_neurectoderm))
+```
+
+
+```{r}
+######subset the neuro cells############
+jm_neuro_cells <- subset(e8.5, cells = neuro )
+
+
+jm_neuro_cells@meta.data$sample <- "jm_neuro"
+jm_neuro_cells@meta.data$lab <- "marioni"
+
+jm_neuro_cells <- Seurat.NormAndScale(jm_neuro_cells)
+
+jm_neuro_cells<- seurat.cellcycle(jm_neuro_cells)
+
+
+
+jm_neuro_cells <- SetIdent(jm_neuro_cells,cells = FBMBHB, value = "FB/MB/HB")
+jm_neuro_cells <- SetIdent(jm_neuro_cells,cells = Neural_crest, value = "Neural crest")
+jm_neuro_cells <- SetIdent(jm_neuro_cells,cells = spinal_cord, value = "Spinal cord")
+jm_neuro_cells <- SetIdent(jm_neuro_cells,cells = Rostral_neurectoderm, value = "Rostral neurectoderm")
+
+day14.integrated <- SetIdent(day14.integrated, value = "MISTR")
+```
+
+
+
+```{r}
+################integration ##############
+###########integration of marioni and kirkeby dataset##########
+
+############recalculating HVG and rescaling dataset#######
+
+jm.neuro_kirkeby.integration_list <- list( jm_neuro_cells, day14.integrated)
+
+ jm.neuro_kirkeby.integration_list <- lapply(X = jm.neuro_kirkeby.integration_list, FUN = function(x) {
+    x <- NormalizeData(x)
+    x <- FindVariableFeatures(x)
+})
+ 
+##########integration##########
+ 
+all.merge.anchors.neuro <- FindIntegrationAnchors(object.list = jm.neuro_kirkeby.integration_list, dims = 1:20)
+ 
+all.integrated.neuro <- IntegrateData(anchorset = all.merge.anchors.neuro, dims = 1:20)
+DefaultAssay(all.integrated.neuro) <- "integrated"
+
+# Run the standard workflow for visualization and clustering
+all.integrated.neuro <- ScaleData(all.integrated.neuro, verbose = FALSE)
+all.integrated.neuro <- FindVariableFeatures(all.integrated.neuro)
+
+all.integrated.neuro <- RunPCA(all.integrated.neuro, npcs = 30, verbose = FALSE)
+
+all.integrated.neuro <- RunUMAP(all.integrated.neuro, reduction = "pca", dims = 1:15)
+all.integrated.neuro@meta.data$celltype[is.na(all.integrated.neuro@meta.data$celltype)]<-"MISTR"
+DimPlot(all.integrated.neuro, reduction = "umap", group.by = "lab")
+DimPlot(all.integrated.neuro, reduction = "umap", group.by = "sample")
+DimPlot(all.integrated.neuro, reduction = "umap", group.by = "celltype")
+
+FeaturePlot(all.integrated.neuro, c("SOX10","OTX2","GBX2","FGF17"), min.cutoff = "q10")
+```
+
+```{r}
+saveRDS(all.integrated.neuro, file = "/projects/gaurav/ms_submission/neuro_ak_rds/mouse_neuro_ak.rds")
+```
+
+```{r}
+sessionInfo()
+```
